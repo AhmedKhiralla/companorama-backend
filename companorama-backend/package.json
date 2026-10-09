@@ -1,0 +1,13 @@
+{
+  "name": "companorama-backend",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "fastify": "^4.26.0",
+    "pg": "^8.11.3",
+    "nodemailer": "^6.9.9"
+  }
+}

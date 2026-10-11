@@ -1,4 +1,11 @@
 const fastify = require('fastify')({ logger: true });
+
+// Enable CORS to allow requests from Netlify and local testing
+fastify.register(require('@fastify/cors'), {
+  origin: true, // Allows all origins (safest for multi-tenant web apps and local files)
+  methods: ['GET', 'POST', 'PUT', 'DELETE']
+});
+
 const { Pool } = require('pg');
 const nodemailer = require('nodemailer');
 

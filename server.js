@@ -36,7 +36,7 @@ const transporter = nodemailer.createTransport({
 });
 
 // ============================================================
-// 2. 21 CFR PART 11 AUDIT TRAIL HELPER
+// 2. 21 CFR PART 11 AUDIT TRAIL HELPERS
 // ============================================================
 
 async function writeAuditLog(client, tenantId, userId, username, action, entity, oldVal, newVal, reason, ip) {
@@ -73,7 +73,7 @@ fastify.get('/health', async (request, reply) => {
 
 // Root Endpoint
 fastify.get('/', async (request, reply) => {
-  return { system: 'Companorama Telemetry & Audit API', status: 'operational', version: '1.0.0' };
+  return { system: 'Companorama Telemetry & Audit API', status: 'operational', version: '2.0.0' };
 });
 
 // ------------------------------------------------------------
@@ -182,12 +182,123 @@ fastify.get('/api/v1/helicopter', async (request, reply) => {
 });
 
 // ------------------------------------------------------------
+// TENANT PROVISIONING (Super Provider Only)
+// ------------------------------------------------------------
+
+fastify.post('/api/v1/provider/tenants', async (request, reply) => {
+  const { group_code, group_name, admin_username, admin_email, admin_password, provider_username } = request.body;
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    const tenantRes = await client.query(`
+      INSERT INTO tenants (group_code, group_name) VALUES ($1, $2) RETURNING id
+    `, [group_code, group_name]);
+    const tenantId = tenantRes.rows[0].id;
+
+    await client.query(`
+      INSERT INTO users (tenant_id, username, email, password_hash, role)
+      VALUES ($1, $2, $3, $4, 'COMPANY_ADMIN')
+    `, [tenantId, admin_username, admin_email, admin_password]);
+
+    await writeAuditLog(
+      client, null, null, provider_username || 'SYSTEM',
+      'PROVISION_TENANT', `Tenant: ${group_code}`, null, { group_name, admin_username },
+      'Onboarded new client company', request.ip
+    );
+
+    await client.query('COMMIT');
+    return { success: true, tenant_id: tenantId };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    return reply.status(500).send({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// ------------------------------------------------------------
+// USER CREATION BY COMPANY ADMIN
+// ------------------------------------------------------------
+
+fastify.post('/api/v1/users', async (request, reply) => {
+  const { tenant_id, creator_username, new_username, new_email, new_password, role, reason } = request.body;
+
+  if (!reason || reason.trim().length === 0) {
+    return reply.status(400).send({ error: 'Part 11 Compliance Error: Reason required for user creation.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const userRes = await client.query(`
+      INSERT INTO users (tenant_id, username, email, password_hash, role)
+      VALUES ($1, $2, $3, $4, $5) RETURNING id
+    `, [tenant_id, new_username, new_email, new_password, role || 'OPERATOR']);
+
+    const newUserId = userRes.rows[0].id;
+
+    await writeAuditLog(
+      client, tenant_id, newUserId, creator_username,
+      'CREATE_USER', `User Account: ${new_username}`, null, { email: new_email, role },
+      reason, request.ip
+    );
+
+    await client.query('COMMIT');
+    return { success: true, user_id: newUserId };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    return reply.status(500).send({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// ------------------------------------------------------------
+// SECURE LOGIN & LOGOUT SESSION AUDIT
+// ------------------------------------------------------------
+
+fastify.post('/api/v1/auth/session', async (request, reply) => {
+  const { username, event_type, tenant_code } = request.body; // event_type: 'LOGIN', 'LOGOUT', 'SESSION_TIMEOUT'
+
+  try {
+    let tenantId = null;
+    if (tenant_code && tenant_code !== 'SERVICE_PROVIDER') {
+      const tRes = await pool.query(`SELECT id FROM tenants WHERE group_code = $1`, [tenant_code]);
+      if (tRes.rows.length > 0) tenantId = tRes.rows[0].id;
+    }
+
+    const uRes = await pool.query(`SELECT id FROM users WHERE username = $1`, [username]);
+    const userId = uRes.rows.length > 0 ? uRes.rows[0].id : null;
+
+    await pool.query(`
+      INSERT INTO session_audit_trail (tenant_id, user_id, username, event_type, ip_address)
+      VALUES ($1, $2, $3, $4, $5)
+    `, [tenantId, userId, username || 'Anonymous', event_type, request.ip]);
+
+    return { success: true };
+  } catch (err) {
+    return reply.status(500).send({ error: err.message });
+  }
+});
+
+// ------------------------------------------------------------
 // ALERTS CONFIGURATION & PART 11 AUDITING
 // ------------------------------------------------------------
 
 fastify.get('/api/v1/alerts', async (request, reply) => {
+  const { tenant_code } = request.query;
   try {
-    const res = await pool.query(`SELECT * FROM alert_rules ORDER BY id DESC`);
+    let query = `SELECT a.* FROM alert_rules a`;
+    let params = [];
+    if (tenant_code) {
+      query += ` JOIN tenants t ON a.tenant_id = t.id WHERE t.group_code = $1`;
+      params.push(tenant_code);
+    }
+    query += ` ORDER BY a.id DESC`;
+    const res = await pool.query(query, params);
     return { alerts: res.rows };
   } catch (err) {
     return reply.status(500).send({ error: err.message });
@@ -213,7 +324,6 @@ fastify.post('/api/v1/alerts', async (request, reply) => {
 
     const newRuleId = insertRes.rows[0].id;
 
-    // Log to Immutable 21 CFR Part 11 Audit Trail
     await writeAuditLog(
       client, 
       tenant_id || 1, 
@@ -239,13 +349,47 @@ fastify.post('/api/v1/alerts', async (request, reply) => {
 });
 
 // ------------------------------------------------------------
-// AUDIT TRAIL LOG VIEWER
+// ISOLATED AUDIT TRAIL LOG VIEWERS
 // ------------------------------------------------------------
 
-fastify.get('/api/v1/audit-trail', async (request, reply) => {
+// Company-Specific Operational Audit Trail
+fastify.get('/api/v1/audit-trail/:tenant_code', async (request, reply) => {
+  const { tenant_code } = request.params;
   try {
-    const res = await pool.query(`SELECT * FROM audit_trail ORDER BY timestamp DESC LIMIT 100`);
+    const res = await pool.query(`
+      SELECT a.* FROM audit_trail a
+      JOIN tenants t ON a.tenant_id = t.id
+      WHERE t.group_code = $1
+      ORDER BY a.timestamp DESC LIMIT 100
+    `, [tenant_code]);
     return { audit_logs: res.rows };
+  } catch (err) {
+    return reply.status(500).send({ error: err.message });
+  }
+});
+
+// Company-Specific Session Login/Logout Audit Trail
+fastify.get('/api/v1/session-audit/:tenant_code', async (request, reply) => {
+  const { tenant_code } = request.params;
+  try {
+    const res = await pool.query(`
+      SELECT s.* FROM session_audit_trail s
+      JOIN tenants t ON s.tenant_id = t.id
+      WHERE t.group_code = $1
+      ORDER BY s.timestamp DESC LIMIT 100
+    `, [tenant_code]);
+    return { session_logs: res.rows };
+  } catch (err) {
+    return reply.status(500).send({ error: err.message });
+  }
+});
+
+// Global Super Provider Audit View (All Companies)
+fastify.get('/api/v1/provider/audit-all', async (request, reply) => {
+  try {
+    const ops = await pool.query(`SELECT * FROM audit_trail ORDER BY timestamp DESC LIMIT 200`);
+    const sessions = await pool.query(`SELECT * FROM session_audit_trail ORDER BY timestamp DESC LIMIT 200`);
+    return { operational_audit: ops.rows, session_audit: sessions.rows };
   } catch (err) {
     return reply.status(500).send({ error: err.message });
   }
@@ -275,7 +419,6 @@ setInterval(async () => {
               ? (new Date() - new Date(rule.last_triggered_at)) / (1000 * 60) 
               : 9999;
 
-            // Cooldown check to prevent duplicate emails
             if (lastTrigDiff > rule.duration_minutes * 2) {
               if (process.env.SMTP_USER) {
                 await transporter.sendMail({
@@ -292,10 +435,7 @@ setInterval(async () => {
                     <p><small>Automated alert generated by Companorama Enterprise System.</small></p>
                   `
                 });
-              } else {
-                fastify.log.warn(`Alert triggered for ${rule.machine_code}, but SMTP_USER is not configured.`);
               }
-
               await pool.query(`UPDATE alert_rules SET last_triggered_at = NOW() WHERE id = $1`, [rule.id]);
             }
           }
@@ -314,7 +454,7 @@ setInterval(async () => {
 const start = async () => {
   try {
     await fastify.listen({ port: Number(PORT), host: HOST });
-    console.log(`🚀 Companorama Production Server listening on http://${HOST}:${PORT}`);
+    console.log(`🚀 Companorama Production Server v2.0 listening on http://${HOST}:${PORT}`);
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);

@@ -220,7 +220,12 @@ fastify.get('/api/v1/helicopter', async (request, reply) => {
         m.machine_code,
         m.machine_name,
         COUNT(e.id) FILTER (WHERE e.event_type = 'cycles count') as total_cycles,
-        COUNT(e.id) FILTER (WHERE e.event_type = 'rejected products cycle count') as rejected_cycles
+        COUNT(e.id) FILTER (WHERE e.event_type = 'rejected products cycle count') as rejected_cycles,
+        (
+          SELECT status_val FROM telemetry_status ts 
+          WHERE ts.machine_code = m.machine_code 
+          ORDER BY ts.timestamp DESC LIMIT 1
+        ) as current_status
       FROM tenants t
       JOIN factories f ON f.tenant_id = t.id
       JOIN areas a ON a.factory_id = f.id

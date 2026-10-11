@@ -81,7 +81,10 @@ fastify.get('/', async (request, reply) => {
 // ------------------------------------------------------------
 
 fastify.post('/api/v1/telemetry', async (request, reply) => {
-  const { machine_code, category, type, val, timestamp, dateKey } = request.body;
+  const { 
+    group_code, factory_name, area_name, machine_name, machine_code, 
+    category, type, val, timestamp, dateKey 
+  } = request.body;
 
   if (!machine_code || !category) {
     return reply.status(400).send({ error: 'Missing required telemetry fields.' });
@@ -90,23 +93,77 @@ fastify.post('/api/v1/telemetry', async (request, reply) => {
   const logTimestamp = timestamp || new Date().toISOString();
   const logDateKey = dateKey || logTimestamp.split('T')[0];
 
+  const client = await pool.connect();
+
   try {
+    await client.query('BEGIN');
+
+    // 1. Auto-provision Tenant if missing
+    const tenantGroup = group_code || 'Comp11_Labs';
+    const tRes = await client.query(`
+      INSERT INTO tenants (group_code, group_name) 
+      VALUES ($1, $1) 
+      ON CONFLICT (group_code) DO UPDATE SET group_code = EXCLUDED.group_code 
+      RETURNING id
+    `, [tenantGroup]);
+    const tenantId = tRes.rows[0].id;
+
+    // 2. Auto-provision Factory if missing
+    const fName = factory_name || 'Default_Factory';
+    const fRes = await client.query(`
+      INSERT INTO factories (tenant_id, factory_code, factory_name) 
+      VALUES ($1, $2, $2) 
+      ON CONFLICT (tenant_id, factory_code) DO UPDATE SET factory_name = EXCLUDED.factory_name 
+      RETURNING id
+    `, [tenantId, fName]);
+    const factoryId = fRes.rows[0].id;
+
+    // 3. Auto-provision Area if missing
+    const aName = area_name || 'Default_Area';
+    let aRes = await client.query(`
+      SELECT id FROM areas WHERE factory_id = $1 AND area_code = $2
+    `, [factoryId, aName]);
+    
+    let areaId;
+    if (aRes.rows.length === 0) {
+      const newArea = await client.query(`
+        INSERT INTO areas (factory_id, area_code, area_name) 
+        VALUES ($1, $2, $2) RETURNING id
+      `, [factoryId, aName]);
+      areaId = newArea.rows[0].id;
+    } else {
+      areaId = aRes.rows[0].id;
+    }
+
+    // 4. Auto-provision Machine if missing
+    const mName = machine_name || machine_code;
+    await client.query(`
+      INSERT INTO machines (area_id, machine_code, machine_name) 
+      VALUES ($1, $2, $3) 
+      ON CONFLICT (machine_code) DO NOTHING
+    `, [areaId, machine_code, mName]);
+
+    // 5. Ingest Telemetry Data
     if (category === 'status_logs') {
-      await pool.query(`
+      await client.query(`
         INSERT INTO telemetry_status (machine_code, status_val, timestamp, date_key)
         VALUES ($1, $2, $3, $4)
       `, [machine_code, val || 'UNKNOWN', logTimestamp, logDateKey]);
     } else {
-      await pool.query(`
+      await client.query(`
         INSERT INTO telemetry_events (machine_code, event_type, timestamp, date_key)
         VALUES ($1, $2, $3, $4)
       `, [machine_code, type || 'cycles count', logTimestamp, logDateKey]);
     }
 
-    return { success: true };
+    await client.query('COMMIT');
+    return { success: true, auto_provisioned: true };
   } catch (err) {
+    await client.query('ROLLBACK');
     fastify.log.error(err);
-    return reply.status(500).send({ error: 'Failed to insert telemetry into PostgreSQL.' });
+    return reply.status(500).send({ error: 'Failed to process telemetry and provision hierarchy.' });
+  } finally {
+    client.release();
   }
 });
 
